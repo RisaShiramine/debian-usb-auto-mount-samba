@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ACTION="${1:-}"
+NAME="${2:-}"
+
+BASE_DIR="/mnt/usb"
+RUNTIME_DIR="/run/usb-auto-mount"
+STATE_DIR="$RUNTIME_DIR/state"
+SHARE_DIR="$RUNTIME_DIR/shares"
+SAMBA_INCLUDE="$RUNTIME_DIR/samba-shares.conf"
+
+PATH_LOCK_FILE="/run/lock/usb-auto-mount-path.lock"
+SAMBA_LOCK_FILE="/run/lock/usb-auto-mount-samba.lock"
+
+DEVICE="/dev/$NAME"
+STATE_FILE="$STATE_DIR/$NAME.state"
+SHARE_FILE="$SHARE_DIR/$NAME.conf"
+
+SHARE_PREFIX="USB_"
+
+log() {
+    printf '[usb-auto-mount] %s\n' "$*"
+}
+
+ensure_directories() {
+    install -d -m 0777 "$BASE_DIR"
+    install -d -m 0755 "$RUNTIME_DIR"
+    install -d -m 0700 "$STATE_DIR" "$SHARE_DIR"
+    install -d -m 0755 /run/lock
+
+    if [[ ! -e "$SAMBA_INCLUDE" ]]; then
+        install -m 0644 /dev/null "$SAMBA_INCLUDE"
+    else
+        chmod 0644 "$SAMBA_INCLUDE"
+    fi
+}
+
+sanitize_name() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+import unicodedata
+
+raw_name = sys.argv[1]
+invalid_characters = set('/\\[]<>:"|?*;#=%$')
+
+safe_name = "".join(
+    "_"
+    if unicodedata.category(character).startswith("C")
+    or character in invalid_characters
+    else character
+    for character in raw_name
+)
+
+safe_name = re.sub(r"\s+", " ", safe_name)
+safe_name = safe_name.strip(" .")
+safe_name = safe_name[:80]
+
+if not safe_name or safe_name in {".", ".."}:
+    safe_name = "UNNAMED"
+
+print(safe_name)
+PY
+}
+
+path_is_occupied() {
+    local path="$1"
+    [[ -e "$path" || -L "$path" ]]
+}
+
+select_mount_path() {
+    local safe_label="$1"
+    local filesystem_uuid="$2"
+    local base_path mount_path short_id counter
+
+    base_path="$BASE_DIR/$safe_label"
+    mount_path="$base_path"
+
+    if path_is_occupied "$mount_path"; then
+        short_id="${filesystem_uuid:-$NAME}"
+        short_id="${short_id//-/}"
+        short_id="${short_id:0:8}"
+        mount_path="${base_path}__${short_id}"
+        counter=2
+
+        while path_is_occupied "$mount_path"; do
+            mount_path="${base_path}__${short_id}_${counter}"
+            counter=$((counter + 1))
+        done
+    fi
+
+    printf '%s\n' "$mount_path"
+}
+
+wait_for_filesystem() {
+    local attempt
+
+    for attempt in {1..40}; do
+        if [[ -b "$DEVICE" ]] && blkid "$DEVICE" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    return 1
+}
+
+reload_samba() {
+    if ! systemctl is-active --quiet smbd.service 2>/dev/null; then
+        return 0
+    fi
+
+    if command -v smbcontrol >/dev/null 2>&1; then
+        if timeout 5s smbcontrol smbd reload-config >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    timeout 10s systemctl reload smbd.service >/dev/null 2>&1
+}
+
+rebuild_samba_config() {
+    local candidate backup share_config
+
+    candidate="$(mktemp "$RUNTIME_DIR/samba-shares.conf.new.XXXXXX")"
+    backup="$(mktemp "$RUNTIME_DIR/samba-shares.conf.old.XXXXXX")"
+
+    {
+        printf '# This file is generated automatically.\n'
+        printf '# Manual changes will be overwritten.\n\n'
+
+        for share_config in "$SHARE_DIR"/*.conf; do
+            [[ -e "$share_config" ]] || continue
+            cat "$share_config"
+            printf '\n'
+        done
+    } >"$candidate"
+
+    chmod 0644 "$candidate"
+
+    if [[ -f "$SAMBA_INCLUDE" ]]; then
+        cp -a -- "$SAMBA_INCLUDE" "$backup"
+    else
+        install -m 0644 /dev/null "$backup"
+    fi
+
+    mv -f -- "$candidate" "$SAMBA_INCLUDE"
+
+    if ! timeout 10s testparm -s >/dev/null 2>&1; then
+        mv -f -- "$backup" "$SAMBA_INCLUDE"
+        log "The generated Samba configuration is invalid."
+        return 1
+    fi
+
+    if ! reload_samba; then
+        mv -f -- "$backup" "$SAMBA_INCLUDE"
+        reload_samba || true
+        log "Failed to reload the Samba configuration."
+        return 1
+    fi
+
+    rm -f -- "$backup"
+}
+
+create_share_file() {
+    local mount_path="$1"
+    local share_name="$2"
+    local temporary_file="${SHARE_FILE}.tmp"
+
+    cat >"$temporary_file" <<EOF_SHARE
+[$share_name]
+    comment = Automatically mounted USB storage
+    path = $mount_path
+    browseable = yes
+    read only = no
+    guest ok = no
+    valid users = root
+    force user = root
+    force group = root
+    create mask = 0777
+    directory mask = 0777
+    force create mode = 0666
+    force directory mode = 0777
+    follow symlinks = no
+    wide links = no
+    dfree cache time = 0
+EOF_SHARE
+
+    chmod 0600 "$temporary_file"
+    mv -f -- "$temporary_file" "$SHARE_FILE"
+}
+
+remove_share_file() {
+    rm -f -- "$SHARE_FILE"
+}
+
+publish_samba_share_locked() {
+    local mount_path="$1"
+    local share_name="$2"
+    local lock_fd result=0
+
+    exec {lock_fd}>"$SAMBA_LOCK_FILE"
+    log "Waiting for the Samba configuration lock."
+
+    if ! flock -w 15 "$lock_fd"; then
+        log "Timed out while waiting for the Samba configuration lock."
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    create_share_file "$mount_path" "$share_name"
+
+    if rebuild_samba_config; then
+        log "Published Samba share: $share_name"
+    else
+        log "Failed to publish Samba share: $share_name"
+        remove_share_file
+        rebuild_samba_config || true
+        result=1
+    fi
+
+    flock -u "$lock_fd" || true
+    exec {lock_fd}>&-
+    return "$result"
+}
+
+remove_samba_share_locked() {
+    local lock_fd result=0
+
+    exec {lock_fd}>"$SAMBA_LOCK_FILE"
+    log "Waiting for the Samba configuration lock."
+
+    if ! flock -w 15 "$lock_fd"; then
+        log "Timed out while waiting for the Samba configuration lock."
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    remove_share_file
+
+    if rebuild_samba_config; then
+        log "Removed Samba share configuration successfully."
+    else
+        log "Failed to rebuild the Samba configuration."
+        result=1
+    fi
+
+    flock -u "$lock_fd" || true
+    exec {lock_fd}>&-
+    return "$result"
+}
+
+mount_device() {
+    local filesystem_type filesystem_label filesystem_uuid safe_label
+    local mount_path share_name mount_options existing_target
+    local path_lock_fd state_temporary_file
+
+    ensure_directories
+    log "Starting mount for $DEVICE."
+
+    if ! wait_for_filesystem; then
+        log "The filesystem on $DEVICE could not be detected."
+        return 1
+    fi
+
+    existing_target="$(findmnt -rn -S "$DEVICE" -o TARGET 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$existing_target" ]]; then
+        log "$DEVICE is already mounted at $existing_target."
+        return 1
+    fi
+
+    filesystem_type="$(blkid -s TYPE -o value "$DEVICE" 2>/dev/null || true)"
+    filesystem_label="$(blkid -s LABEL -o value "$DEVICE" 2>/dev/null || true)"
+    filesystem_uuid="$(blkid -s UUID -o value "$DEVICE" 2>/dev/null || true)"
+
+    if [[ -z "$filesystem_type" ]]; then
+        log "$DEVICE does not contain a supported filesystem."
+        return 1
+    fi
+
+    if [[ -z "$filesystem_label" ]]; then
+        filesystem_label="NO_LABEL_${filesystem_uuid:-$NAME}"
+    fi
+
+    safe_label="$(sanitize_name "$filesystem_label")"
+
+    case "$filesystem_type" in
+        vfat|exfat|ntfs|ntfs3|fuseblk)
+            mount_options="rw,uid=0,gid=0,umask=000,nosuid,nodev"
+            ;;
+        iso9660|udf)
+            mount_options="ro,nosuid,nodev"
+            ;;
+        *)
+            mount_options="rw,nosuid,nodev"
+            ;;
+    esac
+
+    exec {path_lock_fd}>"$PATH_LOCK_FILE"
+    log "Waiting for the mount path allocation lock."
+
+    if ! flock -w 15 "$path_lock_fd"; then
+        log "Timed out while waiting for the mount path allocation lock."
+        exec {path_lock_fd}>&-
+        return 1
+    fi
+
+    mount_path="$(select_mount_path "$safe_label" "$filesystem_uuid")"
+    share_name="${SHARE_PREFIX}$(basename -- "$mount_path")"
+
+    if ! install -d -m 0777 "$mount_path"; then
+        log "Failed to create mount directory: $mount_path"
+        flock -u "$path_lock_fd" || true
+        exec {path_lock_fd}>&-
+        return 1
+    fi
+
+    # Close the lock before mount. FUSE helpers may remain running and
+    # otherwise inherit the lock file descriptor.
+    flock -u "$path_lock_fd" || true
+    exec {path_lock_fd}>&-
+
+    log "Mounting $DEVICE at $mount_path."
+
+    if ! timeout 20s mount -o "$mount_options" "$DEVICE" "$mount_path"; then
+        rmdir -- "$mount_path" 2>/dev/null || true
+        log "Failed to mount $DEVICE at $mount_path."
+        return 1
+    fi
+
+    state_temporary_file="${STATE_FILE}.tmp"
+    printf '%s\n%s\n' "$mount_path" "$share_name" >"$state_temporary_file"
+    chmod 0600 "$state_temporary_file"
+    mv -f -- "$state_temporary_file" "$STATE_FILE"
+
+    if ! publish_samba_share_locked "$mount_path" "$share_name"; then
+        log "Rolling back the mount because Samba publication failed."
+        timeout 8s umount -- "$mount_path" 2>/dev/null ||
+            timeout 5s umount -l -- "$mount_path" 2>/dev/null ||
+            true
+        rmdir -- "$mount_path" 2>/dev/null || true
+        rm -f -- "$STATE_FILE"
+        return 1
+    fi
+
+    log "Device: $DEVICE"
+    log "Filesystem: $filesystem_type"
+    log "Label: $filesystem_label"
+    log "Mount path: $mount_path"
+    log "Samba share: $share_name"
+}
+
+unmount_device() {
+    local mount_path="" share_name="" samba_removed="no" mount_removed="yes"
+    local state_lines=()
+
+    ensure_directories
+    log "Starting removal for $DEVICE."
+
+    if [[ -r "$STATE_FILE" ]]; then
+        mapfile -t state_lines <"$STATE_FILE"
+        mount_path="${state_lines[0]:-}"
+        share_name="${state_lines[1]:-}"
+    else
+        log "State file not found: $STATE_FILE"
+    fi
+
+    if [[ -n "$share_name" ]] && command -v smbcontrol >/dev/null 2>&1; then
+        log "Closing Samba share: $share_name"
+        timeout 3s smbcontrol smbd close-share "$share_name" >/dev/null 2>&1 || true
+    fi
+
+    if remove_samba_share_locked; then
+        samba_removed="yes"
+    fi
+
+    if [[ "$mount_path" == "$BASE_DIR/"* ]]; then
+        if findmnt -rn -M "$mount_path" >/dev/null 2>&1; then
+            log "Unmounting: $mount_path"
+
+            if [[ ! -b "$DEVICE" ]]; then
+                log "The device is no longer present. Using lazy unmount."
+                timeout 5s umount -l -- "$mount_path" || true
+            elif ! timeout 8s umount -- "$mount_path"; then
+                log "Normal unmount failed. Using lazy unmount."
+                timeout 5s umount -l -- "$mount_path" || true
+            fi
+        fi
+
+        if findmnt -rn -M "$mount_path" >/dev/null 2>&1; then
+            mount_removed="no"
+            log "The mount point is still active: $mount_path"
+        elif rmdir -- "$mount_path" 2>/dev/null; then
+            log "Removed mount directory: $mount_path"
+        elif [[ -d "$mount_path" ]]; then
+            mount_removed="no"
+            log "The mount directory is not empty or could not be removed: $mount_path"
+        fi
+    else
+        log "No valid mount path was found."
+    fi
+
+    if [[ "$samba_removed" != "yes" ]]; then
+        log "Retrying Samba share removal."
+        if remove_samba_share_locked; then
+            samba_removed="yes"
+        fi
+    fi
+
+    if [[ "$samba_removed" == "yes" && "$mount_removed" == "yes" ]]; then
+        rm -f -- "$STATE_FILE"
+    else
+        log "Cleanup was incomplete. The state file has been preserved: $STATE_FILE"
+    fi
+
+    [[ "$samba_removed" == "yes" ]] ||
+        log "Warning: Samba configuration cleanup was not completed."
+    [[ "$mount_removed" == "yes" ]] ||
+        log "Warning: Mount point cleanup was not completed."
+
+    log "Removal completed for $DEVICE."
+}
+
+case "$ACTION" in
+    mount) mount_device ;;
+    unmount) unmount_device ;;
+    *)
+        printf 'Usage: %s {mount|unmount} <kernel-device-name>\n' "$0" >&2
+        exit 2
+        ;;
+esac

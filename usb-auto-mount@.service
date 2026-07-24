@@ -1,0 +1,14 @@
+[Unit]
+Description=Automatically mount and share USB filesystem /dev/%I
+BindsTo=dev-%i.device
+After=dev-%i.device
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb-auto-mount mount %i
+ExecStop=/usr/local/sbin/usb-auto-mount unmount %i
+TimeoutStartSec=45
+TimeoutStopSec=90
+KillMode=control-group

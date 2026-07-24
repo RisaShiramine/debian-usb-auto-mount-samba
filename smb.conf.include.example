@@ -1,0 +1,2 @@
+# Add this inside the [global] section of /etc/samba/smb.conf:
+include = /run/usb-auto-mount/samba-shares.conf

@@ -1,0 +1,3 @@
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-auto-mount@%k.service"
+
+ACTION=="remove", SUBSYSTEM=="block", RUN+="/usr/bin/systemctl --no-block stop usb-auto-mount@%k.service"
